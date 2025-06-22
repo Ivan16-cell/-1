@@ -1,0 +1,244 @@
+
+import ifcopenshell as ifc
+import ifcopenshell.geom
+import math
+from tqdm import tqdm
+import trimesh
+import numpy as np
+import json
+
+# Получение элементов из файла
+input_ifc_path = r"C:\Users\Дмитрий\Downloads\12002-81-020600-АР.rvt.ifc"
+ifc_file_1 = ifc.open(input_ifc_path)
+ifc_elements = ifc_file_1.by_type("IfcElement")
+# Задание системы координат
+settings = ifcopenshell.geom.settings()
+settings.set(settings.USE_WORLD_COORDS, True)
+# Получение координат площадки файла
+if "КМ" in input_ifc_path:
+    # Если файл Tekla
+    site = ifc_file_1.by_type("Element")[0]
+    site_location = site.ObjectPlacement.RelativePlacement.Location
+    site_axis = site.ObjectPlacement.RelativePlacement.Axis
+    site_ref_direction = site.ObjectPlacement.RelativePlacement.RefDirection
+else:
+    # Получение координат площадки файла
+    site = ifc_file_1.by_type("IfcSite")[0]
+    site_location = site.ObjectPlacement.RelativePlacement.Location
+    site_axis = site.ObjectPlacement.RelativePlacement.Axis
+    site_ref_direction = site.ObjectPlacement.RelativePlacement.RefDirection
+
+# Установка шага решетки
+
+x_grid = y_grid = z_grid = 5
+
+# Получение глобальных координат точек, принадлежащих геометрии элементов
+x_coords, y_coords, z_coords = [], [], []
+for element in tqdm(ifc_elements, desc="Обработка элементов"):
+    try:
+        shape = ifcopenshell.geom.create_shape(settings, element)
+        verts = np.array(shape.geometry.verts).reshape(-1, 3)
+        faces = np.array(shape.geometry.faces).reshape(-1, 3)
+        mesh = trimesh.Trimesh(vertices=verts, faces=faces, process=False)
+
+        density = 500 / (x_grid * y_grid)
+        mesh_points = int(mesh.area * density)
+        sampled = mesh.sample(mesh_points)
+
+        x_coords.extend(sampled[:, 0])
+        y_coords.extend(sampled[:, 1])
+        z_coords.extend(sampled[:, 2])
+    except Exception:
+        continue
+# Получение минимальных координат объекта
+x_min, y_min, z_min = min(x_coords), min(y_coords), min(z_coords)
+# Перевод глобальных координат в локальные, определение вокселей, в которых находятся эелементы
+voxels = set()
+cos_a = site_ref_direction.DirectionRatios[0]
+sin_a = site_ref_direction.DirectionRatios[1]
+
+for x, y, z in tqdm(
+    zip(x_coords, y_coords, z_coords), total=len(x_coords), desc="Вокселизация"
+):
+    x_i = (x - x_min) * cos_a + (y - y_min) * sin_a
+    y_i = (y - y_min) * cos_a - (x - x_min) * sin_a
+    z_i = z - z_min
+    voxels.add(
+        (math.floor(x_i / x_grid), math.floor(y_i / y_grid), math.floor(z_i / z_grid))
+    )
+# Создание нового ifc файла
+ifc_file = ifcopenshell.file(schema="IFC4X3_ADD2")
+owner = ifc_file.createIfcOwnerHistory()
+
+context = ifc_file.createIfcGeometricRepresentationContext(
+    None,
+    "Model",
+    3,
+    1e-5,
+    ifc_file.createIfcAxis2Placement3D(
+        ifc_file.createIfcCartesianPoint((0.0, 0.0, 0.0)),
+        ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+        ifc_file.createIfcDirection((1.0, 0.0, 0.0)),
+    ),
+    None,
+)
+
+units = ifc_file.createIfcUnitAssignment(
+    [ifc_file.createIfcSIUnit(None, "LENGTHUNIT", None, "METRE")]
+)
+
+project = ifc_file.createIfcProject(
+    ifc.guid.new(), owner, "Voxelization", None, None, None, None, [], None
+)
+project.RepresentationContexts = [context]
+project.UnitsInContext = units
+
+site_placement = ifc_file.createIfcLocalPlacement(
+    None,
+    ifc_file.createIfcAxis2Placement3D(
+        ifc_file.createIfcCartesianPoint([float(x_min), float(y_min), float(z_min)]),
+        ifc_file.createIfcDirection(list(site_axis.DirectionRatios)),
+        ifc_file.createIfcDirection(list(site_ref_direction.DirectionRatios)),
+    ),
+)
+
+site_entity = ifc_file.createIfcSite(
+    ifc.guid.new(),
+    owner,
+    "Site",
+    None,
+    None,
+    site_placement,
+    None,
+    None,
+    "ELEMENT",
+    None,
+    None,
+    None,
+    None,
+    None,
+)
+
+building = ifc_file.createIfcBuilding(
+    ifc.guid.new(),
+    owner,
+    "Building",
+    None,
+    None,
+    ifc_file.createIfcLocalPlacement(site_entity.ObjectPlacement),
+    None,
+    None,
+    "ELEMENT",
+    None,
+    None,
+    None,
+)
+
+storey = ifc_file.
+
+Ivan Tankoff, [22.06.2025 10:16]
+createIfcBuildingStorey(
+    ifc.guid.new(),
+    owner,
+    "Storey",
+    None,
+    None,
+    ifc_file.createIfcLocalPlacement(building.ObjectPlacement),
+    None,
+    None,
+    "ELEMENT",
+    0.0,
+)
+
+ifc_file.createIfcRelAggregates(
+    ifc.guid.new(), owner, None, None, project, [site_entity]
+)
+ifc_file.createIfcRelAggregates(
+    ifc.guid.new(), owner, None, None, site_entity, [building]
+)
+ifc_file.createIfcRelAggregates(ifc.guid.new(), owner, None, None, building, [storey])
+# Создание вокселей
+voxel_objects = []
+
+voxels_for_json = []
+
+for x, y, z in tqdm(voxels, desc="Создание вокселей"):
+    # Определение центра вокселя
+    center = (x * x_grid + x_grid / 2, y * y_grid + y_grid / 2, z * z_grid + z_grid / 2)
+    # Создание площадки для вокселя
+    placement = ifc_file.createIfcLocalPlacement(
+        storey.ObjectPlacement,
+        ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint(center),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((1.0, 0.0, 0.0)),
+        ),
+    )
+    # Создание 2D профиля вокселя
+    profile = ifc_file.createIfcRectangleProfileDef(
+        "AREA",
+        None,
+        ifc_file.createIfcAxis2Placement2D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0)), None
+        ),
+        x_grid,
+        y_grid,
+    )
+    # Выдавливание профиля
+    solid = ifc_file.createIfcExtrudedAreaSolid(
+        profile,
+        ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0, -z_grid / 2)),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((1.0, 0.0, 0.0)),
+        ),
+        ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+        z_grid,
+    )
+    # Создание представления формы вокселя
+    shape = ifc_file.createIfcShapeRepresentation(
+        context, "Body", "SweptSolid", [solid]
+    )
+    # Создание представления вокселя
+    product_def = ifc_file.createIfcProductDefinitionShape(None, None, [shape])
+    # Создание вокселя
+    voxel = ifc_file.createIfcBuildingElementProxy(
+        ifc.guid.new(), owner, "Voxel", None, None, placement, product_def, None, None
+    )
+
+    # Запись вокселя в список для формирование json
+    voxel_dict = {
+        "center": {"x": x_min, "y": y_min, "z": z_min},
+        "length": {"x": x, "y": y, "z": z},
+    }
+    # Запись вокселя в списки
+    voxel_objects.append(voxel)
+    voxels_for_json.append(voxel_dict)
+
+    voxel_objects.append(voxel)
+
+# Размещение вокселей в файле
+ifc_file.createIfcRelContainedInSpatialStructure(
+    ifc.guid.new(), owner, "Building Elements", None, voxel_objects, storey
+)
+
+# Создание словаря вокселизации
+voxelization_dict = {
+    "basePointAnlge": cos_a,
+    "basePointCoordinates": {"x": x_min, "y": y_min, "z": z_min},
+    "voxels": voxels_for_json,
+}
+
+# Запись файла
+output_path = r"C:\Users\Дмитрий\Downloads\Voxel_file.ifc"
+ifc_file.write(f"{output_path}.ifc")
+with open(f"{output_path}.json", "w") as file:
+    json.dump(voxelization_dict, file)
+
+print(output_path)
+
+# Запись файла
+output_path = r"C:\Yandex disk\YandexDisk\Айди_Инжиниринг\Код\Voxel_file.ifc"
+ifc_file.write(output_path)
+
+print(output_path)
