@@ -1,0 +1,322 @@
+
+import numpy as np
+from numpy.linalg import inv
+import numpy.typing as npt
+import ifcopenshell.util.element
+import ifcopenshell.util.placement
+import ifcopenshell.util.representation
+from typing import Optional, Literal, Union, Iterable
+import pprint
+from tqdm import tqdm
+import math
+import json
+
+
+ifc_file_path = 'IFC Examples/12002-81-020602-ОВ3.1.rvt.ifc'
+
+
+def global_coord_to_local(glob_coord, transformation_matrix):
+    glob_coord_homogeneous = np.append(glob_coord, 1)
+    #print(glob_coord_homogeneous)
+    #print()
+    transformation_matrix_inverse = inv(transformation_matrix)
+    loc_coord_homogeneous = np.dot(transformation_matrix_inverse, glob_coord_homogeneous)
+    #print(transformation_matrix)
+    #print(transformation_matrix_inverse)
+    #print(loc_coord_homogeneous)
+    #print()
+    return loc_coord_homogeneous[:3]
+
+def loc_coord_to_global(loc_coord, transformation_matrix):
+    loc_coord_homogeneous = np.append(loc_coord, 1)
+    #print(transformation_matrix)
+    glob_coord_homogeneous = np.dot(transformation_matrix, loc_coord_homogeneous)
+    return glob_coord_homogeneous[:3]
+
+
+def get_bbox(file, entity = 'IfcElement'):
+    settings = ifcopenshell.geom.settings()
+
+    # Инициализируем минимальные и максимальные координаты
+    min_coords_loc = np.array([float('inf'), float('inf'), float('inf')])
+    max_coords_loc = np.array([float('-inf'), float('-inf'), float('-inf')])
+
+    elements = file.by_type(entity)
+
+    model = ifcopenshell.open(ifc_file_path)
+    site = model.by_type("IfcSite")[0]
+    site_matrix = ifcopenshell.util.placement.get_local_placement(site.ObjectPlacement)
+
+    #print(site_matrix)
+    #print()
+
+    for element in tqdm(elements, desc="Поиск bounding box в локальных координатах"):
+
+        try:
+
+            shape = ifcopenshell.geom.create_shape(settings, element)
+            geometry = shape.geometry
+
+            # Получаем вершины элемента в локальных координатах каждого элемента
+            verts = np.array(geometry.verts)
+            verts = verts.reshape(-1, 3)
+
+            # Получаем матрицу трансформации
+            matrix = ifcopenshell.util.shape.get_shape_matrix(shape)
+            matrix = np.array(matrix).reshape(4, 4)[:3, :4]
+
+            # Преобразуем вершины в глобальные координаты
+            homogenous_verts = np.hstack([verts, np.ones((verts.shape[0], 1))])
+            #print(homogenous_verts)
+            global_verts = (matrix @ homogenous_verts.T).T.reshape(-1, 3)
+
+            #print(homogenous_global_verts)
+
+            # Перевод в локальные координаты относительно ifcSite
+
+            loc_coords = []
+            for glob_vert in global_verts:
+                loc_coord = global_coord_to_local(glob_vert, site_matrix)
+                loc_coords.append(loc_coord)
+
+
+            # Обновляем min и max координаты
+            min_coords_loc = np.minimum(min_coords_loc, np.min(loc_coords, axis=0))
+            max_coords_loc = np.maximum(max_coords_loc, np.max(loc_coords, axis=0))
+
+
+        except:
+            ...
+
+    #Определяем базовую точку в локальных координатах (центр bounding box'а)
+    base_point_loc = (min_coords_loc + max_coords_loc)/2
+
+    # Возвращаем крайние точки bounding box'а
+    return min_coords_loc, max_coords_loc, base_point_loc
+
+def get_bbox_glob(min_coords_loc, max_coords_loc, base_point_loc):
+    # Переводим полученные мин и макс в глобальные координаты
+    model = ifcopenshell.open(ifc_file_path)
+    site = model.by_type("IfcSite")[0]
+    site_matrix = ifcopenshell.util.placement.get_local_placement(site.ObjectPlacement)
+    print('Матрица трансформации при переходе к глобальным координатам')
+    print(site_matrix)
+    Angle = getAngleAxis(site_matrix)
+    print('Угол поворота: ',Angle, ' радиан')
+    min_coords_glob = loc_coord_to_global(min_coords_loc, site_matrix)
+    max_coords_glob = loc_coord_to_global(max_coords_loc, site_matrix)
+    base_point_glob = loc_coord_to_global(base_point_loc, site_matrix)
+    print('Базовая точка bounding box: ', base_point_glob.tolist())
+
+    # Возвращаем крайние точки bounding box'а
+
+Ivan Tankoff, [22.06.2025 10:17]
+return min_coords_glob, max_coords_glob,Angle,base_point_glob
+
+#Получение угла поворота в радианах
+def getAngleAxis(matrix):
+    xx = matrix[0, 0]
+    xy = matrix[0, 1]
+
+    theta = - math.atan(xy/xx)
+    return theta
+
+
+def voxel (coords_min, coords_max, Angle, base_point_glob):
+    # Создание нового IFC-файла
+    ifc_file = ifcopenshell.file(schema="IFC4X3_ADD2")
+
+    # Заполнение свойств проекта
+    owner_history = ifc_file.createIfcOwnerHistory()
+    project = ifc_file.createIfcProject(
+        ifcopenshell.guid.new(), owner_history, "Voxel Project", None, None, None, None, [], None
+    )
+    context = ifc_file.createIfcGeometricRepresentationContext(
+        None, "Model", 3, 1e-5, ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0, 0.0)),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((1.0, 0.0, 0.0))
+        ), None
+    )
+    units = ifc_file.createIfcUnitAssignment([])
+
+    project.RepresentationContexts = [context]
+    project.UnitsInContext = units
+
+    site = ifc_file.createIfcSite(
+        ifcopenshell.guid.new(), owner_history, "Site", None, None,
+        ifc_file.createIfcLocalPlacement(
+            None, ifc_file.createIfcAxis2Placement3D(
+                ifc_file.createIfcCartesianPoint((0.0, 0.0, 0.0)),
+                ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+                ifc_file.createIfcDirection((1.0, 0.0, 0.0))
+            )
+        ), None, None, "ELEMENT", None, None, None, None, None
+    )
+    building = ifc_file.createIfcBuilding(
+        ifcopenshell.guid.new(), owner_history, "Building", None, None,
+        ifc_file.createIfcLocalPlacement(site.ObjectPlacement), None, None, "ELEMENT", None, None, None
+    )
+    storey = ifc_file.createIfcBuildingStorey(
+        ifcopenshell.guid.new(), owner_history, "Storey", None, None,
+        ifc_file.createIfcLocalPlacement(building.ObjectPlacement), None, None, "ELEMENT", 0.0
+    )
+
+    # Задание связей
+    ifc_file.createIfcRelAggregates(
+        ifcopenshell.guid.new(), owner_history, None, None, project, [site]
+    )
+    ifc_file.createIfcRelAggregates(
+        ifcopenshell.guid.new(), owner_history, None, None, site, [building]
+    )
+    ifc_file.createIfcRelAggregates(
+        ifcopenshell.guid.new(), owner_history, None, None, building, [storey]
+    )
+
+    # Создание вокселей
+    voxels_objects = []
+    #center_x = (coords_max[0] + coords_min[0]) / 2
+    #center_y = (coords_max[1] + coords_min[1]) / 2
+    #center_z = (coords_max[2] + coords_min[2]) / 2
+
+    x_grid = (coords_max[0] - coords_min[0])/1
+    y_grid = (coords_max[1] - coords_min[1])/1
+    z_grid = (coords_max[2] - coords_min[2])/1
+
+    placement = ifc_file.createIfcLocalPlacement(
+        storey.ObjectPlacement,
+        ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint(base_point_glob),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((math.cos(Angle), math.sin(Angle), 0.0))
+        )
+    )
+
+    profile = ifc_file.createIfcRectangleProfileDef(
+        "AREA", None,
+        ifc_file.createIfcAxis2Placement2D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0)),
+            None
+        ),
+        x_grid, y_grid
+    )
+
+    solid = ifc_file.createIfcExtrudedAreaSolid(
+        profile,
+        ifc_file.createIfcAxis2Placement3D(
+            ifc_file.createIfcCartesianPoint((0.0, 0.0, -z_grid / 2)),
+            ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+            ifc_file.createIfcDirection((1.0, 0.0, 0.0))
+        ),
+        ifc_file.createIfcDirection((0.0, 0.0, 1.0)),
+        z_grid
+    )
+
+    body = ifc_file.createIfcShapeRepresentation(
+        context, "Body", "SweptSolid", [solid]
+    )
+    shape = ifc_file.createIfcProductDefinitionShape(None, None, [body])
+
+    proxy = ifc_file.createIfcBuildingElementProxy(
+        ifcopenshell.guid.new(), owner_history, "Voxel", None, None,
+        placement, shape, None, None
+    )
+    voxels_objects.append(proxy)
+
+
+    ifc_file.
+
+Ivan Tankoff, [22.06.2025 10:17]
+createIfcRelContainedInSpatialStructure(
+        ifcopenshell.guid.new(), owner_history, "Building Elements", None, voxels_objects, storey
+    )
+
+
+    # Сохранение в...
+    file_name = "Voxel_file"
+    output_path = fr"IFC Examples/{file_name}.ifc"
+    ifc_file.write(output_path)
+
+    print('ifc-файл с bounding box: ', output_path)
+
+
+def get_site_placement_data(file_path):
+    """Функция для извлечения данных о размещении IfcSite из IFC-файла.
+
+    Args:
+        file_path (str): Путь к IFC-файлу.
+
+    Returns:
+        dict: Словарь с данными о размещении или сообщением об ошибке.
+    """
+    try:
+        ifc_file = ifcopenshell.open(file_path)
+    except Exception as e:
+        return {"error": f"Ошибка при открытии файла: {str(e)}"}
+
+    sites = ifc_file.by_type("IfcSite")
+
+    if not sites:
+        return {"error": "IfcSite не найден в файле."}
+
+    site = sites[0]
+    object_placement = site.ObjectPlacement
+
+    result = {
+        "ObjectPlacement": str(object_placement),
+        "LocalPlacement": None,
+        "IfcAxis2Placement3D": None
+    }
+
+    if object_placement.is_a("IfcLocalPlacement"):
+        placement_rel_to = object_placement.PlacementRelTo
+        relative_placement = object_placement.RelativePlacement
+
+        result["LocalPlacement"] = {
+            "PlacementRelTo": str(placement_rel_to) if placement_rel_to else None,
+            "RelativePlacement": str(relative_placement)
+        }
+
+        if relative_placement.is_a("IfcAxis2Placement3D"):
+            location = relative_placement.Location
+            axis = relative_placement.Axis
+            ref_direction = relative_placement.RefDirection
+
+            result["IfcAxis2Placement3D"] = {
+                "Location": list(location.Coordinates) if location else None,
+                "Axis": list(axis.DirectionRatios) if axis else None,
+                "RefDirection": list(ref_direction.DirectionRatios) if ref_direction else None
+            }
+
+    return result
+
+
+
+ifc_file = ifcopenshell.open(ifc_file_path)
+loc_min,loc_max,base_point_loc = get_bbox(ifc_file)
+glob_min, glob_max, Angle, base_point_glob = get_bbox_glob(loc_min,loc_max,base_point_loc)
+voxel(loc_min.tolist(), loc_max.tolist(), Angle, base_point_glob.tolist())
+placement_data = get_site_placement_data(ifc_file_path)
+
+pprint.pprint(placement_data)
+
+print("Минимальные лок координаты bounding box:", loc_min)
+print("Максимальные лок координаты bounding box:", loc_max)
+
+print("Минимальные глоб координаты bounding box:", glob_min)
+print("Максимальные глоб координаты bounding box:", glob_max)
+
+
+data = {
+    "Угол поворота": float(Angle),
+    "Базовая точка bounding box": base_point_glob.tolist(),
+    "Минимальные глоб координаты bbox": glob_min.tolist(),
+    "Максимальные глоб координаты bbox": glob_max.tolist(),
+    "IfcSite Placement Data": placement_data
+}
+
+# Запись данных в JSON файл
+with open('bounding_box_data.json', 'w', encoding='utf-8') as f:
+    json.dump(data, f, ensure_ascii=False, indent=4)
+
+print("Данные успешно записаны в bounding_box_data.json")
